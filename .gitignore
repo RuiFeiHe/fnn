@@ -5,8 +5,10 @@
 personal*
 docker-compose.override.yml
 
-# Ignore everything in data/
+# Ignore everything in data/ except config files
 data/*
+!data/train_digital_twin/
+!data/train_digital_twin/*.yaml
 
 # MacOS
 .DS_Store

@@ -71,7 +71,10 @@ class Dataset:
         assert np.unique(dataframe.index).size == len(dataframe), "Index is not unique"
 
         for item in self.dataitems:
-            assert isinstance(dataframe[item][0], Item), f"{dataframe[item][0]} is not an instance of Item"
+            # assert isinstance(dataframe[item][0], Item), f"{dataframe[item][0]} is not an instance of Item"
+            # import ipdb
+            # ipdb.set_trace(context=20)
+            assert isinstance(dataframe[item].iloc[0], Item), f"{dataframe[item][0]} is not an instance of Item"
 
     @property
     def datainfo(self):

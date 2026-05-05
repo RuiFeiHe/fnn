@@ -1,65 +1,77 @@
+import torch
+import torch.utils.data
 import numpy as np
 from tqdm import tqdm
 from torch import randint
 from torch.multiprocessing import spawn, Queue
+from torch.utils.data import Dataset as TorchDataset, DataLoader
 
 
 # -------------- Loader Base --------------
-
 
 class Loader:
     """Loader"""
 
     def __call__(self, training=True, display_progress=True):
-        """
-        Parameters
-        ----------
-        training : bool
-            training or validation
-        display_progress : bool
-            display progress
-
-        Yields
-        ------
-        dict
-            training or validation data
-        """
         raise NotImplementedError()
 
 
+# -------------- Torch Dataset Wrapper --------------
+
+class FnnTorchDataset(TorchDataset):
+    """将 fnn Dataset 包装成 PyTorch Dataset，供 DataLoader 使用"""
+
+    def __init__(self, fnn_dataset, sample_size, training=True):
+        self.fnn_dataset = fnn_dataset
+        self.sample_size = sample_size
+        self.keys = fnn_dataset.keys(training=training)
+
+    def __len__(self):
+        return len(self.keys)
+
+    def __getitem__(self, idx):
+        key = self.keys[idx]
+        high = self.fnn_dataset.df.loc[key].samples - self.sample_size
+        if high > 0:
+            index = randint(high=high, size=(1,)).item() + np.arange(self.sample_size)
+        else:
+            index = np.arange(self.sample_size)
+        return self.fnn_dataset.load(key, index)
+
+
+def collate_fn(batch):
+    """将 list of dict 合并成 dict of stacked arrays"""
+    result = {}
+    for k in batch[0].keys():
+        result[k] = np.stack([b[k] for b in batch], axis=1)
+    return result
+
+
 # -------------- Loader Types --------------
-
-# -- Dataset Loaders --
-
 
 class DatasetLoader(Loader):
     """Dataset Loader"""
 
     def _init(self, dataset):
-        """
-        Parameters
-        ----------
-        dataset : fnn.data.dataset.Dataset
-            dataset to load
-        """
         raise NotImplementedError()
 
 
 class Batches(DatasetLoader):
-    """Randomly Sampled Batches"""
+    """Randomly Sampled Batches — 支持 num_workers 并行加载"""
 
-    def __init__(self, sample_size, batch_size, training_size, validation_size):
+    def __init__(self, sample_size, batch_size, training_size, validation_size,
+                 num_workers=4, prefetch_factor=2):
         """
         Parameters
         ----------
         sample_size : int
-            number of samples in a datapoint
         batch_size : int
-            number of datapoints in a batch
         training_size : int
-            number of training batches in an epoch
         validation_size : int
-            number of validation batches in an epoch
+        num_workers : int
+            并行加载的 worker 数量（默认 4）
+        prefetch_factor : int
+            每个 worker 预取的 batch 数（默认 2）
         """
         assert sample_size > 0
         assert batch_size > 0
@@ -70,131 +82,58 @@ class Batches(DatasetLoader):
         self.batch_size = int(batch_size)
         self.training_size = int(training_size)
         self.validation_size = int(validation_size)
+        self.num_workers = int(num_workers)
+        self.prefetch_factor = int(prefetch_factor)
 
     def _init(self, dataset):
-        """
-        Parameters
-        ----------
-        dataset : fnn.data.dataset.Dataset
-            dataset to load
-        """
         assert dataset.df.samples.min() >= self.sample_size
         self.dataset = dataset
 
-    def _random_keys(self, training=True):
-        if training:
-            keys = self.dataset.keys(training=True)
-            size = self.batch_size * self.training_size
-        else:
-            keys = self.dataset.keys(training=False)
-            size = self.batch_size * self.validation_size
-
-        if not len(keys) or not size:
-            return []
-        else:
-            idx = randint(high=len(keys), size=(size,)).numpy()
-            return keys[idx].tolist()
-
-    def _random_indexes(self, key):
-        high = self.dataset.df.loc[key].samples - self.sample_size
-        if high > 0:
-            return randint(high=high, size=(1,)).item() + np.arange(self.sample_size)
-        else:
-            return np.arange(self.sample_size)
-
-    def _load(self, i, queue, keys, indexes):
-        assert i == 0
-        for key, index in zip(keys, indexes):
-            data = self.dataset.load(key, index)
-            queue.put(data)
-
     def __call__(self, training=True, display_progress=True):
-        """
-        Parameters
-        ----------
-        training : bool
-            training or validation
-        display_progress : bool
-            display progress
+        size = self.training_size if training else self.validation_size
+        desc = "Training Batches" if training else "Validation Batches"
 
-        Yields
-        ------
-        dict
-            training or validation data
-        """
-        keys = self._random_keys(training)
-
-        if keys:
-            indexes = [self._random_indexes(key) for key in keys]
-        else:
+        if not size:
             return
 
-        d = {item: [] for item in self.dataset.dataitems}
-        q = Queue(self.batch_size)
-        c = spawn(self._load, args=(q, keys, indexes), nprocs=1, join=False)
+        torch_dataset = FnnTorchDataset(self.dataset, self.sample_size, training=training)
 
-        if display_progress:
-            if training:
-                iterbar = tqdm(desc="Training Batches", total=self.training_size)
-            else:
-                iterbar = tqdm(desc="Validation Batches", total=self.validation_size)
+        if not len(torch_dataset):
+            return
 
-        for b, _ in enumerate(keys):
+        # 随机采样 size * batch_size 个样本（有放回）
+        indices = np.random.randint(0, len(torch_dataset), size=size * self.batch_size).tolist()
+        subset = torch.utils.data.Subset(torch_dataset, indices)
 
-            for k, v in q.get().items():
-                d[k].append(v)
+        loader = DataLoader(
+            subset,
+            batch_size=self.batch_size,
+            shuffle=False,          # 已经随机采样了 indices
+            num_workers=self.num_workers,
+            prefetch_factor=self.prefetch_factor if self.num_workers > 0 else None,
+            collate_fn=collate_fn,
+            pin_memory=True,        # 加速 CPU→GPU 传输
+            persistent_workers=False,  # 改成 False，每 epoch 重建 worker 避免泄漏
+        )
 
-            if (b + 1) % self.batch_size:
-                continue
+        iterator = tqdm(loader, desc=desc, total=size) if display_progress else loader
 
-            batch = {}
-            for k, v in d.items():
-                batch[k] = np.stack(v, axis=1)
-                v.clear()
-
-            if display_progress:
-                iterbar.update(n=1)
-
+        for batch in iterator:
             yield batch
 
-        assert c.join()
 
-
-# -- Miscellaneous Loaders --
-
+# -------------- Miscellaneous Loaders --------------
 
 class EmptyLoader(Loader):
     """Empty Loader"""
 
     def __init__(self, training_size, validation_size):
-        """
-        Parameters
-        ----------
-        training_size : int
-            number of training iterations in an epoch
-        validation_size : int
-            number of validation iterations in an epoch
-        """
         assert training_size >= 0
         assert validation_size >= 0
-
         self.training_size = int(training_size)
         self.validation_size = int(validation_size)
 
     def __call__(self, training=True, display_progress=True):
-        """
-        Parameters
-        ----------
-        training : bool
-            training or validation
-        display_progress : bool
-            display progress
-
-        Yields
-        ------
-        dict
-            empty dictionary
-        """
         if training:
             iterations = range(self.training_size)
             desc = "Training"

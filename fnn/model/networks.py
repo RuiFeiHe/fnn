@@ -595,3 +595,157 @@ class Visual(Network):
         """
         response = self.generate_response(stimuli, perspectives, modulations)
         return np.array([*response])
+
+    def _forward_core(self, stimulus, perspective, modulation, stream=None, periphery="dark"):
+        """
+        Run perspective + modulation + core and return the raw spatial feature map,
+        bypassing readout and unit. Used for feature-level distillation.
+
+        Parameters
+        ----------
+        stimulus : 4D Tensor
+            [N, C, H, W]
+        perspective : 2D Tensor
+            [N, P]
+        modulation : 2D Tensor
+            [N, M]
+        stream : int | None
+        periphery : str
+
+        Returns
+        -------
+        Tensor
+            [N, S*C_core, H', W'] if stream is None, else [N, C_core, H', W']
+        """
+        if periphery == "dark":
+            perspective = self.perspective(stimulus=stimulus, perspective=perspective, pad_mode="zeros")
+        elif periphery == "extend":
+            perspective = self.perspective(stimulus=stimulus, perspective=perspective, pad_mode="replicate")
+        else:
+            raise ValueError(f"Invalid periphery -- {periphery}")
+
+        if stream is None:
+            perspective = perspective.repeat(1, self.streams, 1, 1)
+            modulation  = modulation.repeat(1, self.streams)
+
+        modulation = self.modulation(modulation=modulation, stream=stream)
+        return self.core(perspective=perspective, modulation=modulation, stream=stream)
+
+
+class Visual_t(Visual):
+    """Visual Network with SVD projection applied to core output."""
+
+    def __init__(self, core, perspective, modulation, readout, reduce, unit, svd_vt, svd_mean, top_k_total, top_k_per_stream, pts_temperature=0.1, pts_n=3):
+        """
+        Parameters
+        ----------
+        svd_vt : 2D Tensor
+            [K_total, C_total] — right singular vectors (top rows used for projection)
+        svd_mean : 1D Tensor
+            [C_total] — per-feature mean used to center before projection
+        top_k_total : int
+            total output channels across all streams after projection (e.g. 256)
+        top_k_per_stream : int
+            output channels per stream after projection (e.g. 64)
+        pts_temperature : float
+            scale divisor T in PTS: sign(x) * |x/T|^(1/n)
+        pts_n : float
+            root exponent n in PTS: sign(x) * |x/T|^(1/n)
+        """
+        super().__init__(core, perspective, modulation, readout, reduce, unit)
+        self.register_buffer('svd_vt', svd_vt)
+        self.register_buffer('svd_mean', svd_mean)
+        self.top_k_total = int(top_k_total)
+        self.top_k_per_stream = int(top_k_per_stream)
+        self.pts_temperature = float(pts_temperature)
+        self.pts_n = float(pts_n)
+
+    def _init(self, stimuli, perspectives, modulations, units, streams):
+        self.stimuli = int(stimuli)
+        self.perspectives = int(perspectives)
+        self.modulations = int(modulations)
+        self.units = int(units)
+        self.streams = int(streams)
+
+        self.perspective._init(stimuli=stimuli, perspectives=self.perspectives)
+        self.modulation._init(modulations=self.modulations, streams=self.streams)
+        self.core._init(
+            perspectives=self.perspective.channels,
+            modulations=self.modulation.features,
+            streams=self.streams,
+        )
+        # Readout receives projected channels, not raw core channels
+        self.readout._init(
+            cores=self.top_k_per_stream,
+            readouts=self.unit.readouts,
+            units=self.units,
+            streams=self.streams,
+        )
+        self.reduce._init(dim=[1], keepdim=False)
+
+    def _pts(self, feat):
+        """Power Transform Standardization: sign(x) * |x / T|^(1/n)."""
+        return torch.sign(feat) * torch.pow(torch.abs(feat / self.pts_temperature), 1.0 / self.pts_n)
+
+    def _project(self, core, stream):
+        """
+        Apply SVD projection to core output.
+
+        Parameters
+        ----------
+        core : Tensor
+            [N, S*C, H, W] if stream is None, else [N, C, H, W]
+        stream : int | None
+
+        Returns
+        -------
+        Tensor
+            [N, S*top_k_per_stream, H, W] if stream is None,
+            else [N, top_k_per_stream, H, W]
+        """
+        if stream is None:
+            vt   = self.svd_vt[:self.top_k_total]          # [K_total, C_total]
+            mean = self.svd_mean                            # [C_total]
+            N, SC, H, W = core.shape
+            x = core - mean[None, :, None, None]
+            # [N, K_total, H, W]
+            x = torch.einsum('k c, N c H W -> N k H W', vt, x)
+            return self._pts(x)
+        else:
+            C = self.core.channels                          # channels per stream
+            sl = slice(stream * C, (stream + 1) * C)
+            vt   = self.svd_vt[:self.top_k_per_stream, sl] # [top_k_per_stream, C]
+            mean = self.svd_mean[sl]                        # [C]
+            x = core - mean[None, :, None, None]
+            return self._pts(torch.einsum('k c, N c H W -> N k H W', vt, x))
+
+    def _forward_core(self, stimulus, perspective, modulation, stream=None, periphery="dark"):
+        """
+        Returns SVD-projected core features for distillation.
+        Shape matches network_s._forward_core: [N, S*top_k_per_stream, H', W']
+        or [N, top_k_per_stream, H', W'] for a specific stream.
+        """
+        raw = super()._forward_core(stimulus, perspective, modulation, stream, periphery)
+        return self._project(raw, stream)
+
+    def _raw(self, stimulus, perspective, modulation, stream=None, periphery="dark"):
+        if periphery == "dark":
+            perspective = self.perspective(stimulus=stimulus, perspective=perspective, pad_mode="zeros")
+        elif periphery == "extend":
+            perspective = self.perspective(stimulus=stimulus, perspective=perspective, pad_mode="replicate")
+        else:
+            raise ValueError(f"Invalid periphery -- {periphery}")
+
+        if stream is None:
+            perspective = perspective.repeat(1, self.streams, 1, 1)
+            modulation  = modulation.repeat(1, self.streams)
+
+        modulation = self.modulation(modulation=modulation, stream=stream)
+        core       = self.core(perspective=perspective, modulation=modulation, stream=stream)
+        core       = self._project(core, stream)
+        readout    = self.readout(core=core, stream=stream)
+
+        if stream is None:
+            return self.reduce(readout)
+        else:
+            return readout

@@ -1,21 +1,24 @@
-data-source:  
-  foundation-core:
-    session: 4
-    scan_idx: 7
-    directory: /project/rf/data/microns_digital_twin/params
-  training: 
+data-source:
+  student:
+    checkpoint: /project/rf/data/train_digital_twin/results_distill_ex15/state_dict.pth
+  training:
     directory: /project/rf/data/train_digital_twin/training_data_27203_4_7
     # max_items: 30
-  evaluation: 
+  evaluation:
     directory: /project/rf/data/train_digital_twin/evaluation_data_27203_4_7
 
+finetune:
+  freeze_modules:
+    - core
+    - modulation.lstm
+
 scheduler:
-  cycle_size: 200
-  warmup_epochs: 20
+  cycle_size: 100
+  warmup_epochs: 10
   warmup_cycles: 1
 
 optimizer:
-  lr: 0.4
+  lr: 0.1
   decay: 0.0001
   momentum: 0.9
   nesterov: true
@@ -24,7 +27,7 @@ optimizer:
   seed: 0
 
 loader:
-  num_workers: 4 
+  num_workers: 4
   prefetch_factor: 2
   sample_size: 100
   batch_size: 8
@@ -36,8 +39,9 @@ objective:
   burnin_frames: 10
 
 save-state:
-  # directory: /project/rf/data/train_digital_twin/results_ex3.ep200
-  directory: /project/rf/code/fnn/svd
+  directory: /project/rf/data/train_digital_twin/results_finetune_student_ex14.ft2
   state_dict: state_dict.pth
+  best_state_dict: best_state_dict.pth
+  init_state_dict: init_state_dict.pth
   metrics_csv: training_metrics.csv
   metrics_tensor: training_metrics.pt
