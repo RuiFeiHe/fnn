@@ -1,6 +1,6 @@
 data-source:
   student:
-    checkpoint: /project/rf/data/train_digital_twin/results_distill_ex15/state_dict.pth
+    checkpoint: /project/rf/data/train_digital_twin/results_distill_ex14/state_dict.pth
   training:
     directory: /project/rf/data/train_digital_twin/training_data_27203_4_7
     # max_items: 30
@@ -8,9 +8,12 @@ data-source:
     directory: /project/rf/data/train_digital_twin/evaluation_data_27203_4_7
 
 finetune:
-  freeze_modules:
-    - core
-    - modulation.lstm
+  # Modules to freeze from the distilled checkpoint.
+  # Set to [] to unfreeze all params and use distilled weights as warm init only.
+  # freeze_modules:
+  #   - core
+  #   - modulation.lstm
+  freeze_modules: []
 
 scheduler:
   cycle_size: 100
@@ -18,7 +21,7 @@ scheduler:
   warmup_cycles: 1
 
 optimizer:
-  lr: 0.1
+  lr: 0.4
   decay: 0.0001
   momentum: 0.9
   nesterov: true
@@ -39,7 +42,7 @@ objective:
   burnin_frames: 10
 
 save-state:
-  directory: /project/rf/data/train_digital_twin/results_finetune_student_ex14.ft2
+  directory: /project/rf/data/train_digital_twin/results_finetune_student_ex14.ft3
   state_dict: state_dict.pth
   best_state_dict: best_state_dict.pth
   init_state_dict: init_state_dict.pth

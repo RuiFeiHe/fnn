@@ -17,7 +17,7 @@ distillation:
   burnin_frames: 10
   sample_stream: true
   pooled: true         # true → SVD+PTS on spatially-pooled [N,C], loss on [N,K]
-  channel_norm: false  # true → divide each channel by its std before MSE
+  channel_norm: true  # true → divide each channel by its std before MSE
 
 scheduler:
   cycle_size: 200
@@ -42,7 +42,7 @@ loader:
   validation_size: 5
 
 save-state:
-  directory: /project/rf/data/train_digital_twin/results_distill_ex17
+  directory: /project/rf/data/train_digital_twin/results_distill_ex18
   state_dict: state_dict.pth
   best_state_dict: best_state_dict.pth
   init_state_dict: init_state_dict.pth

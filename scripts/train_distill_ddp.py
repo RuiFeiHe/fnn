@@ -49,15 +49,19 @@ DEFAULT_CONFIG = Path('/project/rf/code/fnn/data/train_digital_twin/config.yaml'
 
 def calibrate_channel_std(teacher, loader, burnin_frames, device):
     """
-    Run one pass of the teacher over training batches to estimate per-channel
-    std of _forward_core outputs. Used to build the channel-norm weights.
+    Run one pass of the teacher to estimate per-channel std for every stream.
+
+    Per-stream projections use different SVD sub-matrices, so each stream is
+    calibrated independently.
 
     Returns
     -------
-    Tensor [K] — per-channel std, clamped to ≥ 1e-6, on `device`.
+    dict — {None: Tensor[K_total], 0: Tensor[K_per], ..., S-1: Tensor[K_per]}
     """
     teacher.eval()
-    all_feats = []
+    S = teacher.streams
+    stream_keys = [None] + list(range(S))
+    feats = {k: [] for k in stream_keys}
 
     with torch.no_grad():
         for batch in loader(training=True):
@@ -66,18 +70,20 @@ def calibrate_channel_std(teacher, loader, burnin_frames, device):
             modulations  = batch['modulations']
             T = stimuli.shape[0]
 
-            teacher.reset()
-            for t in range(T):
-                s, p, m, _ = teacher.to_tensor(stimuli[t], perspectives[t], modulations[t])
-                feat = teacher._forward_core(s, p, m, stream=None)
-                if feat.dim() == 4:
-                    feat = feat.mean(dim=(-2, -1))   # pool to [N, K]
-                if t >= burnin_frames:
-                    all_feats.append(feat.cpu())
+            for stream_key in stream_keys:
+                teacher.reset()
+                for t in range(T):
+                    sv, p, m, _ = teacher.to_tensor(stimuli[t], perspectives[t], modulations[t])
+                    feat = teacher._forward_core(sv, p, m, stream=stream_key)
+                    if feat.dim() == 4:
+                        feat = feat.mean(dim=(-2, -1))
+                    if t >= burnin_frames:
+                        feats[stream_key].append(feat.cpu())
 
-    all_feats = torch.cat(all_feats, dim=0)          # [N_total, K]
-    std = all_feats.std(dim=0).to(device).clamp(min=1e-6)  # [K]
-    return std
+    return {
+        k: torch.cat(v, dim=0).std(dim=0).to(device).clamp(min=1e-6)
+        for k, v in feats.items()
+    }
 
 
 def distill_batch(teacher, student, batch, burnin_frames, stream, channel_std=None):
@@ -125,8 +131,9 @@ def distill_batch(teacher, student, batch, burnin_frames, stream, channel_std=No
 
         if t >= burnin_frames:
             if channel_std is not None:
-                t_feat = teacher_feat.detach() / channel_std
-                s_feat = student_feat / channel_std
+                std = channel_std[stream]
+                t_feat = teacher_feat.detach() / std
+                s_feat = student_feat / std
             else:
                 t_feat = teacher_feat.detach()
                 s_feat = student_feat
@@ -227,11 +234,17 @@ def main(args):
     if channel_norm:
         if is_main:
             logger.info("Calibrating channel std from teacher outputs...")
-        channel_std = calibrate_channel_std(teacher, loader, burnin_frames, device)
-        dist.broadcast(channel_std, src=0)
+            channel_std = calibrate_channel_std(teacher, loader, burnin_frames, device)
+        else:
+            channel_std = {None: torch.zeros(teacher.top_k_total, device=device)}
+            for s in range(teacher.streams):
+                channel_std[s] = torch.zeros(teacher.top_k_per_stream, device=device)
+        for key in channel_std:
+            dist.broadcast(channel_std[key], src=0)
         if is_main:
-            logger.info(f"Channel std — min={channel_std.min():.4f}  "
-                        f"max={channel_std.max():.4f}  mean={channel_std.mean():.4f}")
+            all_vals = torch.cat(list(channel_std.values()))
+            logger.info(f"Channel std — min={all_vals.min():.4f}  "
+                        f"max={all_vals.max():.4f}  mean={all_vals.mean():.4f}")
     else:
         channel_std = None
 

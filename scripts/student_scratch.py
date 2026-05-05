@@ -24,7 +24,6 @@ from tqdm import tqdm
 
 from fnn.data import load_training_data, load_evaluation_data
 from fnn.microns.build import network_s
-from fnn.microns import load_network_from_params
 from fnn.train.schedulers import CosineLr
 from fnn.train.optimizers import SgdClip
 from fnn.train.loaders import Batches
@@ -42,7 +41,12 @@ DEFAULT_CONFIG = Path('/project/rf/code/fnn/data/train_digital_twin/config_stude
 def run_evaluation(ckpt_path, config, save_dir):
     """Load a checkpoint and compute CC_abs, CC_max, CC_norm on the evaluation set."""
     logger.info(f"Evaluating {ckpt_path.name}")
-    model = load_network_from_params(ckpt_path)
+    params = torch.load(ckpt_path, map_location='cpu')
+    n_units = params['readout.feature.weights.0'].shape[0]
+    model = network_s(units=n_units)
+    model.load_state_dict(params)
+    if torch.cuda.is_available():
+        model = model.cuda()
     model.eval()
 
     eval_data_dir = Path(config['data-source']['evaluation']['directory'])
