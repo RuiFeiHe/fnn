@@ -21,7 +21,7 @@ from tqdm import tqdm
 
 from fnn.data import load_training_data
 from fnn import microns
-from fnn.microns.build import network_t
+from fnn.microns.build import network_t, network_t_pool
 from fnn.utils import logging
 
 logger = logging.get_logger(__name__)
@@ -103,12 +103,13 @@ def collect_features(model, dataset, device):
                     s, p, m, _ = model.to_tensor(
                         stimuli[t], perspectives[t], modulations[t]
                     )
-                    # _forward_core: hook fires on raw core output, returns projected [N,K,H,W]
+                    # _forward_core: hook fires on raw core, returns [N,K,H,W] or [N,K] (pooled)
                     proj = model._forward_core(s, p, m)
 
-                    raw_feats_list.append(raw_captured['feat'].numpy())              # [1, C]
-                    proj_pool = proj.mean(dim=(-2, -1)).detach().cpu().float().numpy()  # [1, K]
-                    proj_feats_list.append(proj_pool)
+                    raw_feats_list.append(raw_captured['feat'].numpy())   # [1, C]
+                    if proj.dim() == 4:
+                        proj = proj.mean(dim=(-2, -1))                    # [1, K]
+                    proj_feats_list.append(proj.detach().cpu().float().numpy())
     finally:
         hook.remove()
 
@@ -129,8 +130,10 @@ def main(args):
     pts_cfg         = config.get('pts', {})
     pts_temperature = pts_cfg.get('temperature', 0.1)
     pts_n           = pts_cfg.get('n', 3)
+    pooled          = config.get('distillation', {}).get('pooled', False)
     logger.info(f"PTS temperature (T) : {pts_temperature}")
     logger.info(f"PTS exponent (n)    : {pts_n}")
+    logger.info(f"Pooled mode         : {pooled}")
 
     # Load dataset
     data_dir  = config['data-source']['training']['directory']
@@ -145,7 +148,8 @@ def main(args):
 
     # Build network_t with foundation weights
     logger.info("Building network_t and loading foundation model weights.")
-    model = network_t(units=units, svd_dir=svd_dir, pts_temperature=pts_temperature, pts_n=pts_n).to(device)
+    build_teacher = network_t_pool if pooled else network_t
+    model = build_teacher(units=units, svd_dir=svd_dir, pts_temperature=pts_temperature, pts_n=pts_n).to(device)
     foundation_model, _ = microns.scan(**config['data-source']['foundation-core'])
     for module_name in ["core", "modulation.lstm"]:
         model.module(module_name).load_state_dict(

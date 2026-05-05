@@ -749,3 +749,53 @@ class Visual_t(Visual):
             return self.reduce(readout)
         else:
             return readout
+
+
+class Visual_t_pool(Visual_t):
+    """
+    Visual_t variant where SVD projection and PTS are applied to
+    spatially-pooled core features (global average pool before projection).
+
+    _forward_core returns [N, K] instead of [N, K, H, W].
+    _raw is unchanged — readout still receives spatial features via Visual_t._project.
+    """
+
+    def _project_pooled(self, core, stream):
+        """
+        Apply SVD + PTS to spatially-pooled core output.
+
+        Parameters
+        ----------
+        core : Tensor
+            [N, S*C] if stream is None, else [N, C]
+
+        Returns
+        -------
+        Tensor
+            [N, K_total] if stream is None, else [N, K_per_stream]
+        """
+        if stream is None:
+            vt   = self.svd_vt[:self.top_k_total]          # [K_total, C_total]
+            mean = self.svd_mean                            # [C_total]
+            x = core - mean[None, :]
+            x = torch.einsum('k c, N c -> N k', vt, x)
+            return self._pts(x)
+        else:
+            C  = self.core.channels
+            sl = slice(stream * C, (stream + 1) * C)
+            vt   = self.svd_vt[:self.top_k_per_stream, sl] # [K_per_stream, C]
+            mean = self.svd_mean[sl]                        # [C]
+            x = core - mean[None, :]
+            return self._pts(torch.einsum('k c, N c -> N k', vt, x))
+
+    def _forward_core(self, stimulus, perspective, modulation, stream=None, periphery="dark"):
+        """
+        Returns spatially-pooled, SVD-projected core features for distillation.
+
+        Shape: [N, K_total] if stream is None, else [N, K_per_stream].
+        """
+        raw    = super(Visual_t, self)._forward_core(
+            stimulus, perspective, modulation, stream, periphery
+        )                                                   # [N, S*C, H, W] or [N, C, H, W]
+        pooled = raw.mean(dim=(-2, -1))                     # [N, S*C] or [N, C]
+        return self._project_pooled(pooled, stream)

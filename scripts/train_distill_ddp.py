@@ -33,7 +33,7 @@ import torch.distributed as dist
 import yaml
 
 from fnn.data import load_training_data
-from fnn.microns.build import network_t, network_s
+from fnn.microns.build import network_t, network_t_pool, network_s
 from fnn.train.schedulers import CosineLr
 from fnn.train.optimizers import SgdClip
 from fnn.train.loaders import Batches
@@ -47,7 +47,40 @@ logger.setLevel(logging.INFO)
 DEFAULT_CONFIG = Path('/project/rf/code/fnn/data/train_digital_twin/config.yaml')
 
 
-def distill_batch(teacher, student, batch, burnin_frames, stream):
+def calibrate_channel_std(teacher, loader, burnin_frames, device):
+    """
+    Run one pass of the teacher over training batches to estimate per-channel
+    std of _forward_core outputs. Used to build the channel-norm weights.
+
+    Returns
+    -------
+    Tensor [K] — per-channel std, clamped to ≥ 1e-6, on `device`.
+    """
+    teacher.eval()
+    all_feats = []
+
+    with torch.no_grad():
+        for batch in loader(training=True):
+            stimuli      = batch['stimuli']
+            perspectives = batch['perspectives']
+            modulations  = batch['modulations']
+            T = stimuli.shape[0]
+
+            teacher.reset()
+            for t in range(T):
+                s, p, m, _ = teacher.to_tensor(stimuli[t], perspectives[t], modulations[t])
+                feat = teacher._forward_core(s, p, m, stream=None)
+                if feat.dim() == 4:
+                    feat = feat.mean(dim=(-2, -1))   # pool to [N, K]
+                if t >= burnin_frames:
+                    all_feats.append(feat.cpu())
+
+    all_feats = torch.cat(all_feats, dim=0)          # [N_total, K]
+    std = all_feats.std(dim=0).to(device).clamp(min=1e-6)  # [K]
+    return std
+
+
+def distill_batch(teacher, student, batch, burnin_frames, stream, channel_std=None):
     """
     Compute MSE distillation loss for one batch.
 
@@ -61,11 +94,13 @@ def distill_batch(teacher, student, batch, burnin_frames, stream):
     batch   : dict with keys 'stimuli' [T,N,...], 'perspectives' [T,N,P], 'modulations' [T,N,M]
     burnin_frames : int
     stream  : int | None
+    channel_std : Tensor [K] | None
+        if provided, features are divided by per-channel std before MSE
 
     Returns
     -------
     Tensor
-        scalar MSE loss (mean over valid frames and spatial positions)
+        scalar MSE loss (mean over valid frames)
     """
     stimuli      = batch['stimuli']       # [T, N, H, W, C] uint8 or similar
     perspectives = batch['perspectives']  # [T, N, P]
@@ -84,9 +119,18 @@ def distill_batch(teacher, student, batch, burnin_frames, stream):
             teacher_feat = teacher._forward_core(s, p, m, stream=stream)
 
         student_feat = student._forward_core(s, p, m, stream=stream)
+        # If teacher returns pooled [N, K], pool student [N, C, H, W] to match
+        if teacher_feat.dim() == 2:
+            student_feat = student_feat.mean(dim=(-2, -1))
 
         if t >= burnin_frames:
-            frame_losses.append(F.mse_loss(student_feat, teacher_feat.detach()))
+            if channel_std is not None:
+                t_feat = teacher_feat.detach() / channel_std
+                s_feat = student_feat / channel_std
+            else:
+                t_feat = teacher_feat.detach()
+                s_feat = student_feat
+            frame_losses.append(F.mse_loss(s_feat, t_feat))
 
     return torch.stack(frame_losses).mean()
 
@@ -111,15 +155,20 @@ def main(args):
     pts_cfg       = config.get('pts', {})
     pts_temperature = pts_cfg.get('temperature', 0.1)
     pts_n           = pts_cfg.get('n', 3)
-    burnin_frames = config.get('distillation', {}).get('burnin_frames',
+    distill_cfg   = config.get('distillation', {})
+    burnin_frames = distill_cfg.get('burnin_frames',
                        config.get('objective', {}).get('burnin_frames', 0))
-    sample_stream = config.get('distillation', {}).get('sample_stream', True)
+    sample_stream = distill_cfg.get('sample_stream', True)
+    pooled        = distill_cfg.get('pooled', False)
+    channel_norm  = distill_cfg.get('channel_norm', False)
 
     if is_main:
         logger.info(f"SVD dir            : {svd_dir}")
         logger.info(f"PTS temperature    : {pts_temperature}")
         logger.info(f"PTS n              : {pts_n}")
         logger.info(f"Burnin frames      : {burnin_frames}")
+        logger.info(f"Pooled distillation: {pooled}")
+        logger.info(f"Channel norm MSE   : {channel_norm}")
 
     # LOAD DATASET  (units column used only for dataset size; GT responses ignored)
     data_dir  = config['data-source']['training'].get('directory', None)
@@ -138,7 +187,8 @@ def main(args):
     if is_main:
         logger.info("Building teacher (network_t) from foundation model.")
     torch.cuda.empty_cache()
-    teacher = network_t(units=units, svd_dir=svd_dir, pts_temperature=pts_temperature, pts_n=pts_n).to(device)
+    build_teacher = network_t_pool if pooled else network_t
+    teacher = build_teacher(units=units, svd_dir=svd_dir, pts_temperature=pts_temperature, pts_n=pts_n).to(device)
     foundation_model, _ = microns.scan(**config['data-source']['foundation-core'])
     for module_name in ["core", "modulation.lstm"]:
         teacher.module(module_name).load_state_dict(
@@ -172,6 +222,18 @@ def main(args):
     if is_main:
         logger.info(f"Trainable parameters: {len(trainable)}")
     ddp_group = ParameterGroup(trainable)
+
+    # CHANNEL-NORM CALIBRATION (rank 0 computes, broadcast to all)
+    if channel_norm:
+        if is_main:
+            logger.info("Calibrating channel std from teacher outputs...")
+        channel_std = calibrate_channel_std(teacher, loader, burnin_frames, device)
+        dist.broadcast(channel_std, src=0)
+        if is_main:
+            logger.info(f"Channel std — min={channel_std.min():.4f}  "
+                        f"max={channel_std.max():.4f}  mean={channel_std.mean():.4f}")
+    else:
+        channel_std = None
 
     # SAVE PATHS
     if is_main:
@@ -218,7 +280,7 @@ def main(args):
 
             with student.train_context(True):
                 for batch in loader(training=True):
-                    loss = distill_batch(teacher, student, batch, burnin_frames, stream)
+                    loss = distill_batch(teacher, student, batch, burnin_frames, stream, channel_std)
 
                     loss.backward()
                     for g in ddp_group_list:
@@ -233,7 +295,7 @@ def main(args):
         with torch.no_grad():
             with student.train_context(False):
                 for batch in loader(training=False):
-                    val_loss = distill_batch(teacher, student, batch, burnin_frames, stream)
+                    val_loss = distill_batch(teacher, student, batch, burnin_frames, stream, channel_std)
                     val_losses.append(val_loss.item())
 
         epoch_train_loss = float(np.mean(train_losses))
