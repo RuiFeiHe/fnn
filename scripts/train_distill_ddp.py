@@ -51,15 +51,18 @@ def calibrate_channel_std(teacher, loader, burnin_frames, device):
     """
     Run one pass of the teacher to estimate per-channel std for every stream.
 
-    Per-stream projections use different SVD sub-matrices, so each stream is
-    calibrated independently.
+    Advances recurrent state exactly once per timestep by calling Visual._forward_core
+    directly, then applies per-stream projections offline (stateless).
 
     Returns
     -------
     dict — {None: Tensor[K_total], 0: Tensor[K_per], ..., S-1: Tensor[K_per]}
     """
+    from fnn.model.networks import Visual
     teacher.eval()
-    S = teacher.streams
+    S  = teacher.streams
+    C  = teacher.core.channels
+    is_pooled = hasattr(teacher, '_project_pooled')
     stream_keys = [None] + list(range(S))
     feats = {k: [] for k in stream_keys}
 
@@ -70,15 +73,22 @@ def calibrate_channel_std(teacher, loader, burnin_frames, device):
             modulations  = batch['modulations']
             T = stimuli.shape[0]
 
-            for stream_key in stream_keys:
-                teacher.reset()
-                for t in range(T):
-                    sv, p, m, _ = teacher.to_tensor(stimuli[t], perspectives[t], modulations[t])
-                    feat = teacher._forward_core(sv, p, m, stream=stream_key)
-                    if feat.dim() == 4:
-                        feat = feat.mean(dim=(-2, -1))
-                    if t >= burnin_frames:
-                        feats[stream_key].append(feat.cpu())
+            teacher.reset()
+            for t in range(T):
+                sv, p, m, _ = teacher.to_tensor(stimuli[t], perspectives[t], modulations[t])
+                # advance recurrent state exactly once
+                raw = Visual._forward_core(teacher, sv, p, m, stream=None)
+                if t < burnin_frames:
+                    continue
+                if is_pooled:
+                    pooled_all = raw.mean(dim=(-2, -1))             # [N, S*C]
+                    feats[None].append(teacher._project_pooled(pooled_all, None).cpu())
+                    for k in range(S):
+                        feats[k].append(teacher._project_pooled(pooled_all[:, k*C:(k+1)*C], k).cpu())
+                else:
+                    feats[None].append(teacher._project(raw, None).mean(dim=(-2, -1)).cpu())
+                    for k in range(S):
+                        feats[k].append(teacher._project(raw[:, k*C:(k+1)*C], k).mean(dim=(-2, -1)).cpu())
 
     return {
         k: torch.cat(v, dim=0).std(dim=0).to(device).clamp(min=1e-6)
@@ -230,15 +240,11 @@ def main(args):
         logger.info(f"Trainable parameters: {len(trainable)}")
     ddp_group = ParameterGroup(trainable)
 
-    # CHANNEL-NORM CALIBRATION (rank 0 computes, broadcast to all)
+    # CHANNEL-NORM CALIBRATION (all ranks compute independently, rank 0 broadcast for consistency)
     if channel_norm:
         if is_main:
-            logger.info("Calibrating channel std from teacher outputs...")
-            channel_std = calibrate_channel_std(teacher, loader, burnin_frames, device)
-        else:
-            channel_std = {None: torch.zeros(teacher.top_k_total, device=device)}
-            for s in range(teacher.streams):
-                channel_std[s] = torch.zeros(teacher.top_k_per_stream, device=device)
+            logger.info("Calibrating channel std from teacher outputs (all ranks)...")
+        channel_std = calibrate_channel_std(teacher, loader, burnin_frames, device)
         for key in channel_std:
             dist.broadcast(channel_std[key], src=0)
         if is_main:
