@@ -1,0 +1,16 @@
+data-source:
+  evaluation:
+    directory: /project/rf/data/sensorium2023_fnn/mouseG/evaluation
+
+objective:
+  burnin_frames: 10
+  units_scale: 1.0   # responses already F0-normalised
+
+eval:
+  checkpoint: state_dict.pth
+  max_frames: 300    # each oracle repeat is 300 frames; null = use all
+
+save-state:
+  directory: /project/rf/data/sensorium2023/results/ex7_20260519_155718
+  best_state_dict: best_state_dict.pth
+  state_dict: state_dict.pth

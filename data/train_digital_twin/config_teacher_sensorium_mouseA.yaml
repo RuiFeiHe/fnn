@@ -1,0 +1,48 @@
+data-source:
+  foundation-core:
+    session: 4
+    scan_idx: 7
+    directory: /project/rf/data/microns_digital_twin/params
+  training:
+    directory: /project/rf/data/sensorium2023_fnn/mouseG/training
+  evaluation:
+    directory: /project/rf/data/sensorium2023_fnn/mouseG/evaluation
+
+model:
+  freeze_core: true
+
+scheduler:
+  cycle_size: 100
+  warmup_epochs: 10
+  warmup_cycles: 1
+
+optimizer:
+  lr: 0.2
+  decay: 0.0001
+  momentum: 0.9
+  nesterov: true
+  clip: 0.01
+  eps: 0.001
+  seed: 0
+  # readout_decay: 0.01
+
+loader:
+  num_workers: 4
+  prefetch_factor: 2
+  sample_size: 100
+  batch_size: 16
+  training_size: 120
+  validation_size: 5
+
+objective:
+  sample_stream: true
+  burnin_frames: 10
+  units_scale: 1.0   # responses already normalised by per-neuron mean (dF/F, mean ~1)
+
+save-state:
+  directory: /project/rf/data/sensorium2023/results/ex7
+  state_dict: state_dict.pth
+  best_state_dict: best_state_dict.pth
+  init_state_dict: init_state_dict.pth
+  metrics_csv: training_metrics.csv
+  metrics_tensor: training_metrics.pt

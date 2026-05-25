@@ -1,0 +1,43 @@
+data-source:
+  training:
+    directory: /project/rf/data/sensorium2023_fnn/mouseA/training
+    max_trials: 300        # trials used to compute response correlations
+
+model:
+  encoder_type: cluster  # cluster (multiscale RBF) or mlp (MLP on xy)
+  n_clusters: 32
+  embed_dim: 1280
+  multiscale: true       # used when encoder_type=cluster
+  top_k_assign: null     # null=global; float (0,1]=fraction of K per scale; int=absolute (clamped)
+  rastermap_init: false  # init cluster centers from rastermap (3 separate runs for multiscale)
+  freeze_centers: false  # freeze cluster centers after init (only learn embeddings, sigma, MLP)
+  mlp_hidden: 256        # used when encoder_type=mlp
+  mlp_layers: 3          # used when encoder_type=mlp
+  mlp_use_xy: true       # used when encoder_type=mlp; drops z coordinate
+
+training:
+  epochs: 2000
+  lr: 0.0005
+  alpha: 0.5              # weight of contrastive loss (0=pred only, 1=contrast only)
+  contrastive_mode: triplet  # 'full', 'sparse', or 'triplet'
+  sparse_top_k: 1000         # pairs per side when contrastive_mode=sparse
+  n_triplets: 20000           # triplets when contrastive_mode=triplet
+  triplet_margin: 0.5        # cosine sim margin
+  triplet_pos_thr: 0.2       # C_resp > this → positive pair
+  triplet_neg_thr: -0.2       # C_resp < this → negative pair
+  triplet_resample_freq: 200 # resample triplets every N epochs (0 = fixed)
+  hard_neg_radius: 50      # µm radius for hard negatives (null = random negatives)
+  triplet_source: rastermap  # 'cresp' (use C_resp) or 'rastermap' (use denoised PC corr)
+  # rastermap uses same triplet_pos_thr / triplet_neg_thr thresholds as cresp
+
+save-state:
+  path: /project/rf/data/sensorium2023_fnn/mouseA/position/ex16/position_embedding.pt
+
+visualization:
+  out: /project/rf/data/sensorium2023_fnn/mouseA/position/ex16/embedding_vis.png
+  out_video: /project/rf/data/sensorium2023_fnn/mouseA/position/ex16/firing.gif
+  out_video_full: /project/rf/data/sensorium2023_fnn/mouseA/position/ex16/firing_full.gif
+  max_trials: 300
+  video_top_k: 3      # number of clusters to show
+  video_fps: 30
+  video_frames: 300   # frames to animate

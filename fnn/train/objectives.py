@@ -52,7 +52,7 @@ class NetworkObjective(Objective):
 class NetworkLoss(NetworkObjective):
     """Network Loss"""
 
-    def __init__(self, sample_stream=True, burnin_frames=0):
+    def __init__(self, sample_stream=True, burnin_frames=0, units_scale=1.0):
         """
         Parameters
         ----------
@@ -60,11 +60,15 @@ class NetworkLoss(NetworkObjective):
             sample stream during training
         burnin_frames : int
             number of initial frames to discard
+        units_scale : float
+            multiplicative scale applied to units before loss computation;
+            use >1 to rescale dF/F into a Poisson-loss-friendly range
         """
         assert burnin_frames >= 0
 
         self.sample_stream = bool(sample_stream)
         self.burnin_frames = int(burnin_frames)
+        self.units_scale   = float(units_scale)
 
         self.log = dict(
             training_objective=[],
@@ -91,6 +95,9 @@ class NetworkLoss(NetworkObjective):
             stream = torch.randint(0, self.network.streams, (1,)).item()
         else:
             stream = None
+
+        if self.units_scale != 1.0:
+            units = units * self.units_scale
 
         losses = self.network.generate_loss(
             units=units,
